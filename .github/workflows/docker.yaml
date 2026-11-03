@@ -44,6 +44,14 @@ jobs:
         # remove-codeql: 'true'
         build-mount-path: '/var/lib/docker/'
 
+    # 新版 GitHub Runner 的 docker 默认使用 containerd 镜像存储,
+    # 镜像会写到未扩容的 /var/lib/containerd(小根盘), 大镜像会报 no space left on device
+    # 这里显式关闭 containerd 存储, 让镜像写入已扩容的 /var/lib/docker
+    - name: Force docker to use /var/lib/docker storage
+      run: |
+        sudo mkdir -p /etc/docker
+        echo '{ "features": { "containerd-snapshotter": false } }' | sudo tee /etc/docker/daemon.json
+
     - name: Restart docker
       run: sudo service docker restart
 
