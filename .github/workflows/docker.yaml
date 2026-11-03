@@ -3,7 +3,7 @@ name: Docker
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [ master ]
 
 # 同一时间只允许一个构建, 避免并行任务争抢磁盘空间
 concurrency:
