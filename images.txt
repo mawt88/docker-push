@@ -14,4 +14,4 @@ cr.weaviate.io/semitechnologies/weaviate:1.35.3
 #gcr.io/cadvisor/cadvisor:v0.47.2
 #smanx/opencode:latest
 #cr.weaviate.io/semitechnologies/weaviate:1.35.3
-mogodb:6.0
+docker.io/library/mogodb:6.0
