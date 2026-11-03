@@ -5,7 +5,4 @@
 #--platform=linux/arm64 docker.io/library/busybox:latest
 #gcr.io/cadvisor/cadvisor:v0.47.2
 #smanx/opencode:latest
-#cr.weaviate.io/semitechnologies/weaviate:1.35.3
-# 以下为测试遗留镜像, 如需转存请取消注释
-#puneetguptanitj/monocular:v1
-#puneetguptanitj/monocular:latest
+cr.weaviate.io/semitechnologies/weaviate:1.35.3
