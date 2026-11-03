@@ -67,12 +67,14 @@ jobs:
         declare -A duplicate_images
         declare -A temp_map
         while IFS= read -r line || [ -n "$line" ]; do
+            # 去除 Windows 换行符(CRLF), 避免 docker pull 报 invalid reference format
+            line="${line%$'\r'}"
             # 忽略空行与注释
             [[ -z "$line" ]] && continue
             if echo "$line" | grep -q '^\s*#'; then
                 continue
             fi
-            
+
             # 获取镜像的完整名称，例如kasmweb/nginx:1.25.3（命名空间/镜像名:版本号）
             image=$(echo "$line" | awk '{print $NF}')
             # 将@sha256:等字符删除
@@ -105,12 +107,14 @@ jobs:
         
         
         while IFS= read -r line || [ -n "$line" ]; do
+            # 去除 Windows 换行符(CRLF)
+            line="${line%$'\r'}"
             # 忽略空行与注释
             [[ -z "$line" ]] && continue
             if echo "$line" | grep -q '^\s*#'; then
                 continue
             fi
-        
+
             echo "docker pull $line"
             # 拉取失败时跳过该镜像, 不中断后续转存
             if ! docker pull "$line"; then
