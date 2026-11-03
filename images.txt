@@ -6,6 +6,6 @@
 #gcr.io/cadvisor/cadvisor:v0.47.2
 #smanx/opencode:latest
 #cr.weaviate.io/semitechnologies/weaviate:1.35.3
-library/mongo:6.0
-library/mongo:7.0
-library/mongo:8.0.34
+docker.io/library/mongo:6.0
+docker.io/library/mongo:7.0
+docker.io/library/mongo:8.0.34
