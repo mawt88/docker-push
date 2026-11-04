@@ -22,6 +22,11 @@ jobs:
   build:
     name: Pull
     runs-on: ubuntu-24.04
+    # 防止 job 卡死时白跑(默认上限 360 分钟)
+    timeout-minutes: 120
+    # 最小权限原则: 本流程只需要读代码
+    permissions:
+      contents: read
     steps:
     - name: Before freeing up disk space
       run: |
@@ -64,6 +69,9 @@ jobs:
 
     - name: Checkout Code
       uses: actions/checkout@v7
+      with:
+        # 后续步骤不使用 git 凭据, 不持久化, 减小凭据暴露面
+        persist-credentials: false
 
     - name: Docker Setup Buildx
       uses: docker/setup-buildx-action@v4
@@ -163,7 +171,22 @@ jobs:
             echo "docker tag $image $new_image"
             docker tag "$image" "$new_image"
             echo "docker push $new_image"
-            docker push "$new_image"
+            # 推送失败自动重试 3 次(应对仓库瞬时抖动), 仍失败则跳过不中断任务
+            push_ok=false
+            for i in 1 2 3; do
+                if docker push "$new_image"; then
+                    push_ok=true
+                    break
+                fi
+                echo "第 $i 次推送失败, 5 秒后重试..."
+                sleep 5
+            done
+            if [ "$push_ok" != true ]; then
+                echo "::warning::镜像推送失败, 已跳过: $new_image"
+                docker rmi "$image" || true
+                docker rmi "$new_image" || true
+                continue
+            fi
             echo "开始清理磁盘空间"
             echo "=============================================================================="
             df -hT
