@@ -2,7 +2,8 @@
 
 使用Github Action将国外的Docker镜像转存到阿里云私有仓库，供国内服务器使用，免费易用<br>
 - 支持DockerHub, gcr.io, k8s.io, ghcr.io等任意仓库<br>
-- 支持最大40GB的大型镜像<br>
+- 默认保留源镜像的全部架构(amd64/arm64等), 也可手动指定单架构<br>
+- 基于skopeo流式转存, 镜像不占本地磁盘, 支持最大40GB的大型镜像<br>
 - 使用阿里云的官方线路，速度快<br>
 
 作者：**[mawt88](https://github.com/mawt88)**<br>
@@ -40,7 +41,9 @@ ALIYUN_NAME_SPACE,ALIYUN_REGISTRY_USER，ALIYUN_REGISTRY_PASSWORD，ALIYUN_REGIS
 可以加tag，也可以不用(默认latest)<br>
 可添加 --platform=xxxxx 的参数指定镜像架构<br>
 可使用 k8s.gcr.io/kube-state-metrics/kube-state-metrics 格式指定私库<br>
-可使用 #开头作为注释<br>
+可使用 # 注释: 支持整行注释, 也支持行尾注释, 如 `nginx:1.25 # 备注`<br>
+可使用 @sha256:xxx 固定镜像内容, 如 `nginx:1.25@sha256:xxx`, 转存后内容与源一致, 仍可按 digest 拉取<br>
+每次构建结束会在 Action 的 Summary 中输出成功/失败清单, 有镜像失败时任务会标红<br>
 ![](doc/images.png)
 文件提交后，自动进入Github Action构建
 
@@ -57,7 +60,8 @@ shrimp-images 即 ALIYUN_NAME_SPACE(阿里云命名空间)<br>
 alpine 即 阿里云中显示的镜像名<br>
 
 ### 多架构
-需要在images.txt中用 --platform=xxxxx手动指定镜像架构
+默认转存源镜像的**全部架构**(manifest list 原样保留, amd64/arm64 等均可直接拉取)<br>
+如只需转存某一架构, 在images.txt中用 --platform=xxxxx手动指定<br>
 指定后的架构会以前缀的形式放在镜像名字前面
 ![](doc/多架构.png)
 

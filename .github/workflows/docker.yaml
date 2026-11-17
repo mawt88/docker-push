@@ -4,10 +4,14 @@ on:
   workflow_dispatch:
   push:
     branches: [ master ]
+    # 仅镜像清单或 workflow 自身变更时触发, 修改 README 等文件不再空跑构建
+    paths:
+      - 'images.txt'
+      - '.github/workflows/docker.yaml'
 
-# 同一时间只允许一个构建, 避免并行任务争抢磁盘空间
+# 同一时间同一分支只允许一个构建, 避免并行任务互相干扰
 concurrency:
-  group: docker-push
+  group: docker-push-${{ github.ref }}
   cancel-in-progress: true
 
 
@@ -20,7 +24,7 @@ env:
 jobs:
 
   build:
-    name: Pull
+    name: Mirror
     runs-on: ubuntu-24.04
     # 防止 job 卡死时白跑(默认上限 360 分钟)
     timeout-minutes: 120
@@ -28,174 +32,244 @@ jobs:
     permissions:
       contents: read
     steps:
-    - name: Before freeing up disk space
-      run: |
-        echo "Before freeing up disk space"
-        echo "=============================================================================="
-        df -hT
-        echo "=============================================================================="
-
-    # 增加可用磁盘空间
-    - name: Maximize build space
-      uses: easimon/maximize-build-space@v10
-      with:
-
-        root-reserve-mb: 2048
-        swap-size-mb: 128
-        remove-dotnet: 'true'
-        remove-haskell: 'true'
-        # 如果空间还是不够用，可以把以下开启，清理出更多空间
-        # remove-android: 'true'
-        # remove-codeql: 'true'
-        build-mount-path: '/var/lib/docker/'
-
-    # 新版 GitHub Runner 的 docker 默认使用 containerd 镜像存储,
-    # 镜像会写到未扩容的 /var/lib/containerd(小根盘), 大镜像会报 no space left on device
-    # 这里显式关闭 containerd 存储, 让镜像写入已扩容的 /var/lib/docker
-    - name: Force docker to use /var/lib/docker storage
-      run: |
-        sudo mkdir -p /etc/docker
-        echo '{ "features": { "containerd-snapshotter": false } }' | sudo tee /etc/docker/daemon.json
-
-    - name: Restart docker
-      run: sudo service docker restart
-
-    - name: Free up disk space complete
-      run: |
-        echo "Free up disk space complete"
-        echo "=============================================================================="
-        df -hT
-        echo "=============================================================================="
 
     - name: Checkout Code
-      uses: actions/checkout@v7
+      # 固定到 commit SHA(v7.0.1), 防止 tag 被劫持的供应链攻击
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       with:
         # 后续步骤不使用 git 凭据, 不持久化, 减小凭据暴露面
         persist-credentials: false
 
-    - name: Docker Setup Buildx
-      uses: docker/setup-buildx-action@v4
-
-    - name: Build and push image Aliyun
+    # 使用 skopeo 流式转存: 镜像不落地本地磁盘(40GB 大镜像更稳),
+    # 且能原样保留多架构 manifest list, 无需扩容磁盘/重启 docker 等步骤
+    - name: Install skopeo
       run: |
-        echo "$ALIYUN_REGISTRY_PASSWORD" | docker login -u "$ALIYUN_REGISTRY_USER" --password-stdin "$ALIYUN_REGISTRY"
-        # 数据预处理,判断镜像是否重名
-        declare -A duplicate_images
-        declare -A temp_map
-        while IFS= read -r line || [ -n "$line" ]; do
-            # 去除 Windows 换行符(CRLF), 避免 docker pull 报 invalid reference format
-            line="${line%$'\r'}"
-            # 忽略空行与注释
+        if ! command -v skopeo >/dev/null 2>&1; then
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq skopeo
+        fi
+        skopeo --version
+
+    - name: Login to Aliyun Registry
+      env:
+        AUTHFILE: ${{ runner.temp }}/aliyun-auth.json
+      run: |
+        umask 077
+        touch "$AUTHFILE"
+        chmod 600 "$AUTHFILE"
+        # 登录失败立即终止, 避免后续推送全部失败而任务仍然"静默全绿"
+        if ! printf '%s' "$ALIYUN_REGISTRY_PASSWORD" | skopeo login --authfile "$AUTHFILE" --username "$ALIYUN_REGISTRY_USER" --password-stdin "$ALIYUN_REGISTRY"; then
+            echo "::error::阿里云仓库登录失败, 请检查 ALIYUN_REGISTRY / ALIYUN_REGISTRY_USER / ALIYUN_REGISTRY_PASSWORD"
+            exit 1
+        fi
+
+    - name: Mirror images
+      env:
+        AUTHFILE: ${{ runner.temp }}/aliyun-auth.json
+      run: |
+        ############ 通用函数 ############
+        # 去除首尾空白
+        trim() {
+            local s="$1"
+            s="${s#"${s%%[![:space:]]*}"}"
+            s="${s%"${s##*[![:space:]]}"}"
+            printf '%s' "$s"
+        }
+
+        # 补全为全限定镜像名(skopeo 不解析 docker hub 短名称)
+        normalize_image() {
+            local img="$1" first
+            case "$img" in
+                */*)
+                    first="${img%%/*}"
+                    case "$first" in
+                        localhost|*.*|*:*) printf '%s' "$img" ;;       # 已是 registry 域名/端口
+                        *) printf '%s' "docker.io/$img" ;;             # docker hub 个人空间, 如 xhofe/alist
+                    esac
+                    ;;
+                *) printf '%s' "docker.io/library/$img" ;;             # 官方库短名, 如 busybox
+            esac
+        }
+
+        ############ 第一遍: 解析 images.txt, 统计重名镜像 ############
+        declare -A ns_of is_dup
+        declare -a a_image a_platform a_ns a_name a_tag a_digest
+        skip_count=0
+
+        while IFS= read -r raw || [ -n "$raw" ]; do
+            # 去除 Windows 换行符(CRLF), 避免 invalid reference format
+            line="${raw%$'\r'}"
+            # 去掉行内注释(镜像引用中不含 #, 可以放心截断)
+            line="${line%%#*}"
+            # 去首尾空白, 忽略空行与纯注释行
+            line="$(trim "$line")"
             [[ -z "$line" ]] && continue
-            if echo "$line" | grep -q '^\s*#'; then
-                continue
+
+            # 解析 --platform 参数(支持 = 和空格两种写法)
+            platform=""
+            if [[ "$line" =~ --platform([[:space:]]*=[[:space:]]*|[[:space:]]+)([^[:space:]]+) ]]; then
+                platform="${BASH_REMATCH[2]}"
             fi
 
-            # 获取镜像的完整名称，例如kasmweb/nginx:1.25.3（命名空间/镜像名:版本号）
-            image=$(echo "$line" | awk '{print $NF}')
-            # 将@sha256:等字符删除
-            image="${image%%@*}"
-            echo "image $image"
-            # 获取镜像名:版本号  例如nginx:1.25.3
-            image_name_tag=$(echo "$image" | awk -F'/' '{print $NF}')
-            echo "image_name_tag $image_name_tag"
-            # 获取命名空间 例如kasmweb,  这里有种特殊情况 docker.io/nginx，把docker.io当成命名空间，也OK
-            name_space=$(echo "$image" | awk -F'/' '{if (NF==3) print $2; else if (NF==2) print $1; else print ""}')
-            echo "name_space: $name_space"
-            # 这里不要是空值影响判断
-            name_space="${name_space}_"
-            # 获取镜像名例如nginx
-            image_name=$(echo "$image_name_tag" | awk -F':' '{print $1}')
-            echo "image_name: $image_name"
-            
-            # 如果镜像存在于数组中，则添加temp_map
-            if [[ -n "${temp_map[$image_name]}" ]]; then
-                 # 如果temp_map已经存在镜像名，判断是不是同一命名空间
-                 if [[ "${temp_map[$image_name]}" != $name_space  ]]; then
-                    echo "duplicate image name: $image_name"
-                    duplicate_images[$image_name]="true"
-                 fi
-            else
-                # 存镜像的命名空间
-                temp_map[$image_name]=$name_space
-            fi       
+            # 最后一个字段为镜像引用
+            image="${line##* }"
+            if [[ -z "$image" || "$image" == -* ]]; then
+                echo "::warning::无法解析, 已忽略该行: $raw"
+                skip_count=$((skip_count+1))
+                continue
+            fi
+            image="$(normalize_image "$image")"
+
+            # @sha256:... 固定内容, 转存时按内容寻址, 内容与源完全一致
+            digest=""
+            if [[ "$image" == *@* ]]; then
+                digest="${image#*@}"
+            fi
+            core="${image%%@*}"
+            # 镜像名:tag, 例如 nginx:1.25.3
+            name_tag="${core##*/}"
+            # 镜像名, 例如 nginx
+            name="${name_tag%%:*}"
+            # tag, 例如 1.25.3(可能为空)
+            tag=""
+            if [[ "$name_tag" == *:* ]]; then
+                tag="${name_tag##*:}"
+            fi
+
+            # 命名空间, 例如 kasmweb(docker.io/library/nginx 这类全限定名取中间段)
+            IFS='/' read -r -a segs <<< "$core"
+            ns=""
+            if (( ${#segs[@]} >= 3 )); then
+                ns="${segs[${#segs[@]}-2]}"
+            fi
+
+            # 重名统计: 同名镜像来自不同命名空间时, 目标名需要加命名空间前缀
+            if [[ -z "${ns_of[$name]:-}" ]]; then
+                ns_of[$name]="$ns"
+            elif [[ "${ns_of[$name]}" != "$ns" ]]; then
+                echo "duplicate image name: $name"
+                is_dup[$name]=true
+            fi
+
+            a_image+=("$image")
+            a_platform+=("$platform")
+            a_ns+=("$ns")
+            a_name+=("$name")
+            a_tag+=("$tag")
+            a_digest+=("$digest")
         done < images.txt
-        
-        
-        while IFS= read -r line || [ -n "$line" ]; do
-            # 去除 Windows 换行符(CRLF)
-            line="${line%$'\r'}"
-            # 忽略空行与注释
-            [[ -z "$line" ]] && continue
-            if echo "$line" | grep -q '^\s*#'; then
-                continue
+
+        total=${#a_image[@]}
+        echo "共解析出 $total 个镜像, 忽略无法解析的 $skip_count 行"
+        if (( total == 0 )); then
+            echo "::warning::images.txt 中没有有效镜像"
+            exit 0
+        fi
+
+        ############ 第二遍: 逐个流式转存 ############
+        declare -a rows
+        ok_count=0
+        fail_count=0
+
+        for i in "${!a_image[@]}"; do
+            image="${a_image[$i]}"
+            platform="${a_platform[$i]}"
+            name="${a_name[$i]}"
+            ns="${a_ns[$i]}"
+            tag="${a_tag[$i]}"
+            digest="${a_digest[$i]}"
+
+            # 无 tag 时: 纯 digest 引用用短 digest 作 tag, 否则默认 latest
+            if [[ -z "$tag" ]]; then
+                if [[ -n "$digest" ]]; then
+                    tag="sha256-${digest#sha256:}"
+                    tag="${tag:0:19}"
+                else
+                    tag="latest"
+                fi
             fi
 
-            echo "docker pull $line"
-            # 拉取失败时跳过该镜像, 不中断后续转存
-            if ! docker pull "$line"; then
-                echo "::warning::镜像拉取失败, 已跳过: $line"
-                continue
-            fi
-            platform=$(echo "$line" | awk -F'--platform[ =]' '{if (NF>1) print $2}' | awk '{print $1}')
-            echo "platform is $platform"
-            # 如果存在架构信息 将架构信息拼到镜像名称前面
-            if [ -z "$platform" ]; then
-                platform_prefix=""
-            else
+            # 如果存在架构信息, 将架构信息拼到镜像名称前面
+            platform_prefix=""
+            if [[ -n "$platform" ]]; then
                 platform_prefix="${platform//\//_}_"
             fi
-            echo "platform_prefix is $platform_prefix"
-            # 获取镜像的完整名称，例如kasmweb/nginx:1.25.3（命名空间/镜像名:版本号）
-            image=$(echo "$line" | awk '{print $NF}')
 
-            # 获取 镜像名:版本号  例如nginx:1.25.3
-            image_name_tag=$(echo "$image" | awk -F'/' '{print $NF}')
-            # 获取命名空间 例如kasmweb  这里有种特殊情况 docker.io/nginx，把docker.io当成命名空间，也OK
-            name_space=$(echo "$image" | awk -F'/' '{if (NF==3) print $2; else if (NF==2) print $1; else print ""}')
-            # 获取镜像名例  例如nginx
-            image_name=$(echo "$image_name_tag" | awk -F':' '{print $1}')
-        
-            name_space_prefix=""
-            # 如果镜像名重名
-            if [[ -n "${duplicate_images[$image_name]}" ]]; then
-               #如果命名空间非空，将命名空间加到前缀
-               if [[ -n "${name_space}" ]]; then
-                  name_space_prefix="${name_space}_"
-               fi
+            # 如果镜像名重名, 将命名空间加到前缀
+            ns_prefix=""
+            if [[ -n "${is_dup[$name]:-}" && -n "$ns" ]]; then
+                ns_prefix="${ns}_"
             fi
-            
-            # 将@sha256:等字符删除
-            image_name_tag="${image_name_tag%%@*}"
-            new_image="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$platform_prefix$name_space_prefix$image_name_tag"
-            echo "docker tag $image $new_image"
-            docker tag "$image" "$new_image"
-            echo "docker push $new_image"
-            # 推送失败自动重试 3 次(应对仓库瞬时抖动), 仍失败则跳过不中断任务
-            push_ok=false
-            for i in 1 2 3; do
-                if docker push "$new_image"; then
-                    push_ok=true
+
+            dst="docker://$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$platform_prefix$ns_prefix$name:$tag"
+
+            copy_args=(copy --authfile "$AUTHFILE")
+            if [[ -n "$platform" ]]; then
+                # 仅转存指定架构: linux/arm64[/variant], 也兼容只写 arm64 的形式
+                IFS='/' read -r -a p <<< "$platform"
+                case ${#p[@]} in
+                    1) copy_args+=(--override-os linux --override-arch "${p[0]}") ;;
+                    2) copy_args+=(--override-os "${p[0]}" --override-arch "${p[1]}") ;;
+                    3) copy_args+=(--override-os "${p[0]}" --override-arch "${p[1]}" --override-variant "${p[2]}") ;;
+                esac
+            else
+                # 不指定架构时保留源镜像的全部架构
+                copy_args+=(--all)
+            fi
+
+            if [[ -n "$digest" ]]; then
+                echo "提示: 引用含 digest($digest), 按内容寻址转存, 内容与源完全一致, 通常仍可用 @$digest 拉取"
+            fi
+
+            echo "::group::[$((i+1))/$total] $image → ${dst#docker://}"
+            # 转存失败自动重试 3 次(递增等待, 应对仓库瞬时抖动), 仍失败则跳过不中断任务
+            ok=false
+            for attempt in 1 2 3; do
+                if skopeo "${copy_args[@]}" "docker://$image" "$dst"; then
+                    ok=true
                     break
                 fi
-                echo "第 $i 次推送失败, 5 秒后重试..."
-                sleep 5
+                if (( attempt < 3 )); then
+                    wait_s=$((attempt * 5))
+                    echo "第 $attempt 次转存失败, ${wait_s}s 后重试..."
+                    sleep "$wait_s"
+                fi
             done
-            if [ "$push_ok" != true ]; then
-                echo "::warning::镜像推送失败, 已跳过: $new_image"
-                docker rmi "$image" || true
-                docker rmi "$new_image" || true
-                continue
+            echo "::endgroup::"
+
+            src_disp="$image"
+            if [[ -n "$platform" ]]; then
+                src_disp="--platform=$platform $image"
             fi
-            echo "开始清理磁盘空间"
-            echo "=============================================================================="
-            df -hT
-            echo "=============================================================================="
-            docker rmi "$image" || true
-            docker rmi "$new_image" || true
-            echo "磁盘空间清理完毕"
-            echo "=============================================================================="
-            df -hT
-            echo "=============================================================================="     
-            
-        done < images.txt
+            if [[ "$ok" == true ]]; then
+                ok_count=$((ok_count+1))
+                rows+=("| \`$src_disp\` | \`${dst#docker://}\` | ✅ |")
+            else
+                fail_count=$((fail_count+1))
+                rows+=("| \`$src_disp\` | \`${dst#docker://}\` | ❌ |")
+                echo "::warning::镜像转存失败, 已跳过: $image"
+            fi
+        done
+
+        ############ 汇总: 写入 Job Summary, 有失败时任务标红 ############
+        {
+            echo "## 🐳 镜像转存结果"
+            echo
+            echo "**成功 $ok_count / 共 $total**(失败 $fail_count)"
+            echo
+            echo "| 源镜像 | 目标镜像 | 结果 |"
+            echo "| :--- | :--- | :-: |"
+            for r in "${rows[@]}"; do
+                echo "$r"
+            done
+        } >> "$GITHUB_STEP_SUMMARY"
+        echo "镜像转存完成: 成功 $ok_count, 失败 $fail_count"
+
+        if (( fail_count > 0 )); then
+            echo "::error::有 $fail_count 个镜像转存失败, 详情见上方日志与 Summary"
+            exit 1
+        fi
+
+    - name: Remove credentials
+      if: always()
+      run: rm -f "$RUNNER_TEMP/aliyun-auth.json"
