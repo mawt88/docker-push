@@ -92,7 +92,7 @@ jobs:
 
         ############ 第一遍: 解析 images.txt, 统计重名镜像 ############
         declare -A ns_of is_dup
-        declare -a a_image a_platform a_ns a_name a_tag a_digest
+        declare -a a_image a_platform a_all a_ns a_name a_tag a_digest
         skip_count=0
 
         while IFS= read -r raw || [ -n "$raw" ]; do
@@ -104,15 +104,38 @@ jobs:
             line="$(trim "$line")"
             [[ -z "$line" ]] && continue
 
-            # 解析 --platform 参数(支持 = 和空格两种写法)
+            # 逐个解析参数: 支持 --all(转存全部架构)与 --platform(指定架构, = 和空格两种写法)
+            # 镜像引用为行内唯一不以 - 开头的 token, 参数位置不限
             platform=""
-            if [[ "$line" =~ --platform([[:space:]]*=[[:space:]]*|[[:space:]]+)([^[:space:]]+) ]]; then
-                platform="${BASH_REMATCH[2]}"
-            fi
+            all_arch=false
+            image=""
+            read -r -a toks <<< "$line"
+            n=${#toks[@]}
+            for (( k=0; k<n; k++ )); do
+                t="${toks[$k]}"
+                case "$t" in
+                    --all)
+                        all_arch=true
+                        ;;
+                    --platform=*)
+                        platform="${t#--platform=}"
+                        ;;
+                    --platform)
+                        if (( k+1 < n )); then
+                            platform="${toks[$((k+1))]}"
+                            k=$((k+1))
+                        fi
+                        ;;
+                    -*)
+                        echo "::warning::未知参数已忽略: $t (行: $raw)"
+                        ;;
+                    *)
+                        image="$t"
+                        ;;
+                esac
+            done
 
-            # 最后一个字段为镜像引用
-            image="${line##* }"
-            if [[ -z "$image" || "$image" == -* ]]; then
+            if [[ -z "$image" ]]; then
                 echo "::warning::无法解析, 已忽略该行: $raw"
                 skip_count=$((skip_count+1))
                 continue
@@ -152,6 +175,7 @@ jobs:
 
             a_image+=("$image")
             a_platform+=("$platform")
+            a_all+=("$all_arch")
             a_ns+=("$ns")
             a_name+=("$name")
             a_tag+=("$tag")
@@ -173,6 +197,7 @@ jobs:
         for i in "${!a_image[@]}"; do
             image="${a_image[$i]}"
             platform="${a_platform[$i]}"
+            all_arch="${a_all[$i]}"
             name="${a_name[$i]}"
             ns="${a_ns[$i]}"
             tag="${a_tag[$i]}"
@@ -204,17 +229,18 @@ jobs:
 
             copy_args=(copy --authfile "$AUTHFILE")
             if [[ -n "$platform" ]]; then
-                # 仅转存指定架构: linux/arm64[/variant], 也兼容只写 arm64 的形式
+                # 仅转存指定架构: linux/arm64[/variant], 也兼容只写 arm64 的形式(--platform 优先于 --all)
                 IFS='/' read -r -a p <<< "$platform"
                 case ${#p[@]} in
                     1) copy_args+=(--override-os linux --override-arch "${p[0]}") ;;
                     2) copy_args+=(--override-os "${p[0]}" --override-arch "${p[1]}") ;;
                     3) copy_args+=(--override-os "${p[0]}" --override-arch "${p[1]}" --override-variant "${p[2]}") ;;
                 esac
-            else
-                # 不指定架构时保留源镜像的全部架构
+            elif [[ "$all_arch" == true ]]; then
+                # --all: 保留源镜像的全部架构
                 copy_args+=(--all)
             fi
+            # 两者都未指定: skopeo 默认仅转存运行平台(linux/amd64)的架构
 
             if [[ -n "$digest" ]]; then
                 echo "提示: 引用含 digest($digest), 按内容寻址转存, 内容与源完全一致, 通常仍可用 @$digest 拉取"
